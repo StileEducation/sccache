@@ -602,7 +602,9 @@ where
     }
 
     let mut cmd = creator.new_command_sync(exe);
-    cmd.args(&cmdline).current_dir(cwd);
+    cmd.args(&cmdline)
+        .args(&passthrough_extra_args(&cmdline))
+        .current_dir(cwd);
     if log_enabled!(Trace) {
         trace!("running command: {:?}", cmd);
     }
@@ -622,6 +624,65 @@ where
         // Arbitrary.
         2
     }))
+}
+
+/// Extra arguments for a compile that sccache runs locally without caching.
+///
+/// On macOS, ld64 records a dylib's absolute output path as its install name
+/// (`LC_ID_DYLIB`), and the UUID, code signature and even the section layout
+/// follow from it. A proc-macro built in two checkouts of the same workspace
+/// therefore differs byte-for-byte, and since sccache never caches proc-macros
+/// and hashes each extern by content, every crate that uses the macro misses in
+/// all but one checkout. Giving proc-macros a path-independent install name
+/// makes them reproducible; rustc loads them by path, so nothing reads it.
+fn passthrough_extra_args(cmdline: &[OsString]) -> Vec<OsString> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    let mut proc_macro = false;
+    let mut crate_name = None;
+    let mut extra_filename = "";
+    let mut args = cmdline.iter().map(|a| a.to_str());
+    while let Some(arg) = args.next() {
+        // A non-UTF-8 argument isn't one we're looking for, but leave such
+        // compiles alone rather than guess at them.
+        let Some(arg) = arg else {
+            return vec![];
+        };
+        let mut value = |flag: &str| -> Option<&str> {
+            match arg.strip_prefix(flag) {
+                Some("") => args.next().flatten(),
+                Some(rest) => rest.strip_prefix('='),
+                None => None,
+            }
+        };
+        if let Some(types) = value("--crate-type") {
+            proc_macro |= types.split(',').any(|t| t == "proc-macro");
+        } else if let Some(name) = value("--crate-name") {
+            crate_name = Some(name);
+        } else if let Some(target) = value("--target") {
+            if !target.contains("apple") {
+                return vec![];
+            }
+        } else if let Some(codegen) = value("-C") {
+            if let Some(extra) = codegen.strip_prefix("extra-filename=") {
+                extra_filename = extra;
+            } else if codegen.contains("install_name") {
+                return vec![];
+            }
+        } else if let Some(extra) = arg.strip_prefix("-Cextra-filename=") {
+            extra_filename = extra;
+        } else if arg.contains("install_name") {
+            return vec![];
+        }
+    }
+    match (proc_macro, crate_name) {
+        (true, Some(name)) => vec![
+            "-C".into(),
+            format!("link-arg=-Wl,-install_name,@rpath/lib{name}{extra_filename}.dylib").into(),
+        ],
+        _ => vec![],
+    }
 }
 
 /// Send a `Compile` request to the sccache server `conn`, and handle the response.
@@ -966,6 +1027,82 @@ mod test {
     };
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_passthrough_extra_args() {
+        let install_name = || -> Vec<OsString> {
+            vec![
+                "-C".into(),
+                "link-arg=-Wl,-install_name,@rpath/libfoo_derive-0123abcd.dylib".into(),
+            ]
+        };
+        let cases: Vec<(&str, Vec<&str>, Vec<OsString>)> = vec![
+            (
+                "proc-macro with separate values",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "-C",
+                    "extra-filename=-0123abcd",
+                    "src/lib.rs",
+                ],
+                install_name(),
+            ),
+            (
+                "proc-macro with joined values",
+                vec![
+                    "--crate-name=foo_derive",
+                    "--crate-type=proc-macro",
+                    "-Cextra-filename=-0123abcd",
+                    "src/lib.rs",
+                ],
+                install_name(),
+            ),
+            (
+                "rlib",
+                vec!["--crate-name", "foo", "--crate-type", "lib", "src/lib.rs"],
+                vec![],
+            ),
+            (
+                "proc-macro for a non-Apple target",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "src/lib.rs",
+                ],
+                vec![],
+            ),
+            (
+                "proc-macro that already sets an install name",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "-C",
+                    "link-arg=-Wl,-install_name,@rpath/x.dylib",
+                    "src/lib.rs",
+                ],
+                vec![],
+            ),
+            ("C compile", vec!["-c", "foo.c", "-o", "foo.o"], vec![]),
+        ];
+        for (label, args, expected) in cases {
+            let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            let expected = if cfg!(target_os = "macos") {
+                expected
+            } else {
+                vec![]
+            };
+            assert_eq!(passthrough_extra_args(&args), expected, "{label}");
+        }
+    }
 
     fn make_runtime() -> Runtime {
         tokio::runtime::Builder::new_current_thread()
