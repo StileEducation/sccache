@@ -356,6 +356,45 @@ where
     deps
 }
 
+/// Rewrite a dep-info file restored from the cache so that paths under the
+/// populating compilation's cargo profile dir point at `our_profile_dir`.
+/// Returns `None` when there is nothing to rewrite.
+fn rebase_dep_info(contents: &str, our_profile_dir: &Path) -> Result<Option<String>> {
+    // The first rule's target is the dep-info file itself, as written by the
+    // populating compilation: <their profile dir>/deps/<name>.d. Make escapes
+    // spaces in rule paths, but `# env-dep:` values are written raw.
+    let first_target = contents
+        .split(": ")
+        .next()
+        .context("restored dep-info has no rules")?
+        .replace("\\ ", " ");
+    let their_profile_dir = Path::new(&first_target)
+        .parent()
+        .and_then(Path::parent)
+        .context("restored dep-info target has no profile dir")?;
+    if !their_profile_dir.is_absolute() || their_profile_dir == our_profile_dir {
+        return Ok(None);
+    }
+    let (Some(theirs), Some(ours)) = (their_profile_dir.to_str(), our_profile_dir.to_str()) else {
+        bail!("non-UTF-8 profile dir in dep-info");
+    };
+    let (theirs, ours) = (format!("{theirs}/"), format!("{ours}/"));
+    let escape = |p: &str| p.replace(' ', "\\ ");
+    let (theirs_escaped, ours_escaped) = (escape(&theirs), escape(&ours));
+    Ok(Some(
+        contents
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with("# env-dep:") {
+                    line.replace(&theirs, &ours)
+                } else {
+                    line.replace(&theirs_escaped, &ours_escaped)
+                }
+            })
+            .collect(),
+    ))
+}
+
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
@@ -1574,10 +1613,21 @@ where
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
+        // Build-script env deps (OUT_DIR) are absolute paths under the cargo
+        // profile dir (the parent of --out-dir), which differs per checkout.
+        // Hash them relative to it so identical crates hit across worktrees.
+        let abs_out_dir = cwd.join(&self.parsed_args.output_dir);
+        let profile_dir = abs_out_dir.parent();
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
+            match profile_dir.and_then(|d| Path::new(val).strip_prefix(d).ok()) {
+                Some(rel) => {
+                    m.update(b"<cargo-profile-dir>/");
+                    rel.as_os_str().hash(&mut HashToDigest { digest: &mut m });
+                }
+                None => val.hash(&mut HashToDigest { digest: &mut m }),
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -1949,6 +1999,28 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let outputs_rewriter = Box::new(RustOutputsRewriter { dep_info });
 
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
+    }
+
+    /// The restored dep-info lists the populating checkout's profile dir (e.g.
+    /// build-script OUT_DIR files). Cargo fingerprints those paths, so left
+    /// alone they go missing when that checkout's target dir is deleted and
+    /// every later build here is dirty. Rebase them onto our profile dir.
+    fn fixup_cache_hit_outputs(&self) -> Result<()> {
+        let Some(dep_info) = &self.dep_info else {
+            return Ok(());
+        };
+        let dep_info = self.cwd.join(dep_info);
+        let our_profile_dir = dep_info
+            .parent()
+            .and_then(Path::parent)
+            .context("dep-info path has no profile dir")?;
+        let contents = fs::read_to_string(&dep_info)
+            .with_context(|| format!("reading restored dep-info {}", dep_info.display()))?;
+        if let Some(rebased) = rebase_dep_info(&contents, our_profile_dir)? {
+            fs::write(&dep_info, rebased)
+                .with_context(|| format!("rewriting restored dep-info {}", dep_info.display()))?;
+        }
+        Ok(())
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
@@ -3482,6 +3554,18 @@ proc_macro false
     }
 
     fn mock_dep_info(creator: &Arc<Mutex<MockCommandCreator>>, dep_srcs: &[&str]) {
+        mock_dep_info_with_env_deps(creator, dep_srcs, &[])
+    }
+
+    fn mock_dep_info_with_env_deps(
+        creator: &Arc<Mutex<MockCommandCreator>>,
+        dep_srcs: &[&str],
+        env_deps: &[(&str, &str)],
+    ) {
+        let env_deps = env_deps
+            .iter()
+            .map(|(k, v)| format!("# env-dep:{k}={v}"))
+            .collect::<Vec<_>>();
         // Mock the `rustc --emit=dep-info` process by writing
         // a dep-info file.
         let mut sorted_deps = dep_srcs
@@ -3503,6 +3587,9 @@ proc_macro false
             writeln!(f, "blah: {}", sorted_deps.iter().join(" "))?;
             for d in sorted_deps.iter() {
                 writeln!(f, "{}:", d)?;
+            }
+            for e in env_deps.iter() {
+                writeln!(f, "{}", e)?;
             }
             Ok(MockChild::new(exit_status(0), "", ""))
         });
@@ -3665,6 +3752,20 @@ proc_macro false
     where
         F: Fn(&Path) -> Result<()>,
     {
+        hash_key_with_env_deps(f, args, env_vars, &[], pre_func, preprocessor_cache_mode)
+    }
+
+    fn hash_key_with_env_deps<F>(
+        f: &TestFixture,
+        args: &[&str],
+        env_vars: &[(OsString, OsString)],
+        env_deps: &[(&str, &str)],
+        pre_func: F,
+        preprocessor_cache_mode: bool,
+    ) -> String
+    where
+        F: Fn(&Path) -> Result<()>,
+    {
         let oargs = args.iter().map(OsString::from).collect::<Vec<OsString>>();
         let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
@@ -3697,7 +3798,7 @@ proc_macro false
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
 
-        mock_dep_info(&creator, &["foo.rs"]);
+        mock_dep_info_with_env_deps(&creator, &["foo.rs"], env_deps);
         mock_file_names(&creator, &["foo.rlib"]);
         hasher
             .generate_hash_key(
@@ -3774,6 +3875,84 @@ proc_macro false
                 mk_files,
                 preprocessor_cache_mode,
             )
+        );
+    }
+
+    fn out_dir_hash_key(f: &TestFixture, checkout: &str, out_dir_rel: &str) -> String {
+        let out_dir = format!("{checkout}/target/debug/deps");
+        let env_out_dir = f
+            .tempdir
+            .path()
+            .join(checkout)
+            .join("target/debug")
+            .join(out_dir_rel);
+        let args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            &out_dir,
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        hash_key_with_env_deps(
+            f,
+            &args,
+            &[],
+            &[("OUT_DIR", env_out_dir.to_str().unwrap())],
+            nothing,
+            false,
+        )
+    }
+
+    #[test]
+    fn test_equal_hashes_out_dir_across_checkouts() {
+        let f = TestFixture::new();
+        assert_eq!(
+            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out"),
+            out_dir_hash_key(&f, "checkout-b", "build/foo-0123/out"),
+        );
+    }
+
+    #[test]
+    fn test_different_hashes_out_dir_within_profile_dir() {
+        let f = TestFixture::new();
+        assert_ne!(
+            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out"),
+            out_dir_hash_key(&f, "checkout-a", "build/foo-4567/out"),
+        );
+    }
+
+    #[test]
+    fn test_rebase_dep_info() {
+        let restored = "\
+/a/target/debug/deps/foo-1.d: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+
+/a/target/debug/deps/libfoo-1.rlib: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+
+/a/target/debug/build/foo-2/out/gen.rs:
+
+# env-dep:OUT_DIR=/a/target/debug/build/foo-2/out
+";
+        let expected = "\
+/b\\ c/target/debug/deps/foo-1.d: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+
+/b\\ c/target/debug/deps/libfoo-1.rlib: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+
+/b\\ c/target/debug/build/foo-2/out/gen.rs:
+
+# env-dep:OUT_DIR=/b c/target/debug/build/foo-2/out
+";
+        let rebased = rebase_dep_info(restored, Path::new("/b c/target/debug"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebased, expected);
+        assert_eq!(
+            rebase_dep_info(&rebased, Path::new("/b c/target/debug")).unwrap(),
+            None,
+            "rebasing onto our own profile dir is a no-op"
         );
     }
 

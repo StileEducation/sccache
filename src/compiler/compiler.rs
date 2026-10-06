@@ -654,7 +654,10 @@ where
 
                 let hit = CompileResult::CacheHit(duration);
                 match entry.extract_objects(filtered_outputs, &pool).await {
-                    Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
+                    Ok(()) => {
+                        compilation.fixup_cache_hit_outputs()?;
+                        Ok(CacheLookupResult::Success(hit, output))
+                    }
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
                             debug!("[{}]: Failed to decompress object", out_pretty);
@@ -1125,6 +1128,12 @@ where
 
     fn is_locally_preprocessed(&self) -> bool {
         true
+    }
+
+    /// Fix up outputs restored from a cache hit that embed the absolute paths
+    /// of the compilation that originally populated the entry.
+    fn fixup_cache_hit_outputs(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Returns an iterator over the results of this compilation.
