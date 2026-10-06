@@ -654,10 +654,16 @@ where
 
                 let hit = CompileResult::CacheHit(duration);
                 match entry.extract_objects(filtered_outputs, &pool).await {
-                    Ok(()) => {
-                        compilation.fixup_cache_hit_outputs()?;
-                        Ok(CacheLookupResult::Success(hit, output))
-                    }
+                    Ok(()) => match compilation.fixup_cache_hit_outputs() {
+                        Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
+                        Err(e) => {
+                            warn!(
+                                "[{}]: Couldn't fix up restored outputs, compiling instead: {:#}",
+                                out_pretty, e
+                            );
+                            Ok(CacheLookupResult::Miss(MissType::CacheReadError))
+                        }
+                    },
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
                             debug!("[{}]: Failed to decompress object", out_pretty);

@@ -356,43 +356,70 @@ where
     deps
 }
 
-/// Rewrite a dep-info file restored from the cache so that paths under the
-/// populating compilation's cargo profile dir point at `our_profile_dir`.
-/// Returns `None` when there is nothing to rewrite.
+/// Rewrite a dep-info file restored from the cache so that build-script output
+/// paths (`<profile dir>/build/...`, where OUT_DIR lives) under the populating
+/// compilation's cargo profile dir point at `our_profile_dir`. Those are the
+/// only absolute, checkout-specific paths a cache hit can carry: every other
+/// input is hashed by path-independent content. Returns `None` when there is
+/// nothing to rewrite.
 fn rebase_dep_info(contents: &str, our_profile_dir: &Path) -> Result<Option<String>> {
     // The first rule's target is the dep-info file itself, as written by the
-    // populating compilation: <their profile dir>/deps/<name>.d. Make escapes
-    // spaces in rule paths, but `# env-dep:` values are written raw.
-    let first_target = contents
-        .split(": ")
-        .next()
-        .context("restored dep-info has no rules")?
-        .replace("\\ ", " ");
-    let their_profile_dir = Path::new(&first_target)
-        .parent()
-        .and_then(Path::parent)
-        .context("restored dep-info target has no profile dir")?;
+    // populating compilation: <their profile dir>/deps/<name>.d. Rule paths
+    // escape spaces; `# env-dep:` values don't (rustc escapes only backslashes
+    // and newlines there).
+    // Anything unexpected is left as restored: at worst cargo sees a dependency
+    // it can't find and rebuilds, which is what upstream sccache always does.
+    let Some((first_target, _)) = contents.split_once(": ") else {
+        return Ok(None);
+    };
+    let first_target = first_target.replace("\\ ", " ");
+    let Some(their_profile_dir) = Path::new(&first_target).parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
     if !their_profile_dir.is_absolute() || their_profile_dir == our_profile_dir {
         return Ok(None);
     }
     let (Some(theirs), Some(ours)) = (their_profile_dir.to_str(), our_profile_dir.to_str()) else {
-        bail!("non-UTF-8 profile dir in dep-info");
+        return Ok(None);
     };
-    let (theirs, ours) = (format!("{theirs}/"), format!("{ours}/"));
+    let (theirs, ours) = (format!("{theirs}/build/"), format!("{ours}/build/"));
     let escape = |p: &str| p.replace(' ', "\\ ");
     let (theirs_escaped, ours_escaped) = (escape(&theirs), escape(&ours));
     Ok(Some(
         contents
             .split_inclusive('\n')
-            .map(|line| {
-                if line.starts_with("# env-dep:") {
-                    line.replace(&theirs, &ours)
-                } else {
-                    line.replace(&theirs_escaped, &ours_escaped)
-                }
+            .map(|line| match line.strip_prefix("# env-dep:") {
+                Some(_) => replace_paths(line, &theirs, &ours, b'='),
+                None => replace_paths(line, &theirs_escaped, &ours_escaped, b' '),
             })
             .collect(),
     ))
+}
+
+/// Replace `from` with `to` where it starts a path: at the start of `line` or
+/// right after `separator`, so `/x/a/target/...` isn't mistaken for `/a/target/...`.
+fn replace_paths(line: &str, from: &str, to: &str, separator: u8) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut at_boundary = true;
+    while let Some(index) = rest.find(from) {
+        let boundary = if index == 0 {
+            at_boundary
+        } else {
+            rest.as_bytes()[index - 1] == separator
+        };
+        let (before, after) = rest.split_at(index);
+        out.push_str(before);
+        if boundary {
+            out.push_str(to);
+        } else {
+            out.push_str(from);
+        }
+        rest = &after[from.len()..];
+        at_boundary = false;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
@@ -3926,33 +3953,60 @@ proc_macro false
     }
 
     #[test]
+    fn test_replace_paths_only_at_path_starts() {
+        let cases = [
+            ("start of line", "/a/x: /a/y", "/b/x: /b/y"),
+            ("inside a longer path", "/x/a/y: /z/a/w", "/x/a/y: /z/a/w"),
+            ("mixed", "/a/x: /q/a/x /a/y", "/b/x: /q/a/x /b/y"),
+        ];
+        for (label, line, expected) in cases {
+            assert_eq!(replace_paths(line, "/a/", "/b/", b' '), expected, "{label}");
+        }
+        assert_eq!(
+            replace_paths("# env-dep:OUT_DIR=/a/out", "/a/", "/b/", b'='),
+            "# env-dep:OUT_DIR=/b/out"
+        );
+        assert_eq!(rebase_dep_info("", Path::new("/b")).unwrap(), None);
+        assert_eq!(
+            rebase_dep_info("foo.d: src/lib.rs\n", Path::new("/b")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn test_rebase_dep_info() {
         let restored = "\
-/a/target/debug/deps/foo-1.d: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+/a/target/debug/deps/foo-1.d: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /a/target/debug/common.rs /registry/x.rs
 
-/a/target/debug/deps/libfoo-1.rlib: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+/a/target/debug/deps/libfoo-1.rlib: src/lib.rs /a/target/debug/build/foo-2/out/gen.rs /a/target/debug/common.rs /registry/x.rs
 
 /a/target/debug/build/foo-2/out/gen.rs:
 
 # env-dep:OUT_DIR=/a/target/debug/build/foo-2/out
 ";
+        // Only build-script output moves; a file the crate names explicitly
+        // elsewhere under the profile dir is a real dependency on that file.
         let expected = "\
-/b\\ c/target/debug/deps/foo-1.d: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+/a/target/debug/deps/foo-1.d: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /a/target/debug/common.rs /registry/x.rs
 
-/b\\ c/target/debug/deps/libfoo-1.rlib: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /registry/x.rs
+/a/target/debug/deps/libfoo-1.rlib: src/lib.rs /b\\ c/target/debug/build/foo-2/out/gen.rs /a/target/debug/common.rs /registry/x.rs
 
 /b\\ c/target/debug/build/foo-2/out/gen.rs:
 
 # env-dep:OUT_DIR=/b c/target/debug/build/foo-2/out
 ";
-        let rebased = rebase_dep_info(restored, Path::new("/b c/target/debug"))
-            .unwrap()
-            .unwrap();
+        let ours = Path::new("/b c/target/debug");
+        let rebased = rebase_dep_info(restored, ours).unwrap().unwrap();
         assert_eq!(rebased, expected);
         assert_eq!(
-            rebase_dep_info(&rebased, Path::new("/b c/target/debug")).unwrap(),
+            rebase_dep_info(&rebased, ours).unwrap().as_deref(),
+            Some(expected),
+            "rebasing twice changes nothing more"
+        );
+        assert_eq!(
+            rebase_dep_info(restored, Path::new("/a/target/debug")).unwrap(),
             None,
-            "rebasing onto our own profile dir is a no-op"
+            "rebasing onto its own profile dir is a no-op"
         );
     }
 

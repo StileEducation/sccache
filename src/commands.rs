@@ -649,6 +649,10 @@ fn passthrough_extra_args(cmdline: &[OsString]) -> Vec<OsString> {
         let Some(arg) = arg else {
             return vec![];
         };
+        // Arguments in a response file can't be seen from here.
+        if arg.starts_with('@') {
+            return vec![];
+        }
         let mut value = |flag: &str| -> Option<&str> {
             match arg.strip_prefix(flag) {
                 Some("") => args.next().flatten(),
@@ -661,17 +665,21 @@ fn passthrough_extra_args(cmdline: &[OsString]) -> Vec<OsString> {
         } else if let Some(name) = value("--crate-name") {
             crate_name = Some(name);
         } else if let Some(target) = value("--target") {
-            if !target.contains("apple") {
+            // A triple's vendor; a custom target is a JSON path we can't judge.
+            if target.ends_with(".json") || target.split('-').nth(1) != Some("apple") {
                 return vec![];
             }
-        } else if let Some(codegen) = value("-C") {
+        } else if let Some(codegen) = value("-C").or_else(|| arg.strip_prefix("-C")) {
             if let Some(extra) = codegen.strip_prefix("extra-filename=") {
                 extra_filename = extra;
-            } else if codegen.contains("install_name") {
+            } else if codegen.contains("install_name")
+                // -Wl, is cc-driver syntax; a linker run directly (ld64.lld, a
+                // custom linker) would reject it.
+                || codegen.starts_with("linker=")
+                || codegen.starts_with("linker-flavor=")
+            {
                 return vec![];
             }
-        } else if let Some(extra) = arg.strip_prefix("-Cextra-filename=") {
-            extra_filename = extra;
         } else if arg.contains("install_name") {
             return vec![];
         }
@@ -1090,6 +1098,70 @@ mod test {
                     "src/lib.rs",
                 ],
                 vec![],
+            ),
+            (
+                "proc-macro linked by a direct linker",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "-C",
+                    "linker-flavor=ld64.lld",
+                    "src/lib.rs",
+                ],
+                vec![],
+            ),
+            (
+                "proc-macro with a custom linker",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "-Clinker=/opt/bin/ld64.lld",
+                    "src/lib.rs",
+                ],
+                vec![],
+            ),
+            (
+                "proc-macro with a response file",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "@args.rsp",
+                ],
+                vec![],
+            ),
+            (
+                "proc-macro for a custom target JSON under a path containing apple",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "--target",
+                    "/Users/apple/custom.json",
+                    "src/lib.rs",
+                ],
+                vec![],
+            ),
+            (
+                "proc-macro for an explicit Apple target",
+                vec![
+                    "--crate-name",
+                    "foo_derive",
+                    "--crate-type",
+                    "proc-macro",
+                    "-C",
+                    "extra-filename=-0123abcd",
+                    "--target",
+                    "aarch64-apple-darwin",
+                    "src/lib.rs",
+                ],
+                install_name(),
             ),
             ("C compile", vec!["-c", "foo.c", "-o", "foo.o"], vec![]),
         ];
