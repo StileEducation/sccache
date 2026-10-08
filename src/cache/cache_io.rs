@@ -200,16 +200,17 @@ impl CacheRead {
                     None => bail!("Output file without a parent directory!"),
                 };
                 if let Some((source, mode)) = self.clone_sources.remove(&key) {
-                    // A failed clone (the stored copy was just evicted, or the
-                    // output dir is on another volume) reads as a cache miss.
-                    restore_clone(&source, dir, &path, mode).map_err(|e| {
-                        debug!(
-                            "Couldn't clone {} to {}: {e:#}",
-                            source.display(),
-                            path.display()
-                        );
-                        anyhow!(DecompressionFailure)
-                    })?;
+                    // A stored copy evicted since the lookup reads as a cache miss.
+                    restore_clone(&source, dir, &path, mode, crate::util::clone_file).map_err(
+                        |e| {
+                            debug!(
+                                "Couldn't clone {} to {}: {e:#}",
+                                source.display(),
+                                path.display()
+                            );
+                            anyhow!(DecompressionFailure)
+                        },
+                    )?;
                     continue;
                 }
                 // Write the cache entry to a tempfile and then atomically
@@ -257,10 +258,32 @@ impl CacheRead {
 /// Clone `source` into place at `path` (atomically, via a temporary file in
 /// `dir`), with `mode` and a fresh mtime, as if it had just been written:
 /// build tools compare output mtimes against their inputs.
-fn restore_clone(source: &Path, dir: &Path, path: &Path, mode: Option<u32>) -> Result<()> {
+///
+/// Where the output dir can't hold a clone of the cache's file (it's on
+/// another volume or filesystem), this falls back to an ordinary copy: the
+/// hit just costs the write that cloning would have saved.
+fn restore_clone(
+    source: &Path,
+    dir: &Path,
+    path: &Path,
+    mode: Option<u32>,
+    clone: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let tmp = tempfile::Builder::new()
         .prefix(".sccache-clone")
-        .make_in(dir, |tmp| crate::util::clone_file(source, tmp))?;
+        .make_in(dir, |tmp| match clone(source, tmp) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e),
+            Err(e) => {
+                debug!(
+                    "Can't clone {} to {}, copying: {e}",
+                    source.display(),
+                    tmp.display()
+                );
+                let _ = std::fs::remove_file(tmp);
+                std::fs::copy(source, tmp).map(drop)
+            }
+        })?;
     if let Some(mode) = mode {
         set_file_mode(tmp.path(), mode)?;
     }
@@ -463,6 +486,36 @@ impl Default for CacheWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_restore_clone_copies_when_cloning_is_impossible() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("stored");
+        std::fs::write(&source, b"object bytes").unwrap();
+        let out = dir.path().join("out/libfoo.rlib");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let cross_device = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        };
+        restore_clone(
+            &source,
+            out.parent().unwrap(),
+            &out,
+            Some(0o640),
+            cross_device,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"object bytes");
+
+        // A stored copy that has been evicted is a miss, not something to copy.
+        let evicted = dir.path().join("evicted");
+        let missing = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        assert!(restore_clone(&evicted, out.parent().unwrap(), &out, None, missing).is_err());
+        let leftovers = std::fs::read_dir(out.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary files left behind");
+    }
 
     #[cfg(unix)]
     #[test]
