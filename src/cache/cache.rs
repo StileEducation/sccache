@@ -110,6 +110,12 @@ pub trait Storage: Send + Sync {
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
 
+    /// If this storage keeps outputs as copy-on-write clones, the directory to
+    /// stage them in (see `CacheWrite::from_objects_cloned`).
+    fn clone_staging_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
     /// Returns `None` if the entry is not found, or if the implementation doesn't support raw access.
     /// This is used by multi-level caches to backfill faster levels.

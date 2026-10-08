@@ -73,6 +73,27 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 /// Data stored in the compiler cache.
 pub struct CacheRead {
     zip: ZipArchive<Box<dyn ReadSeek>>,
+    /// Objects the storage holds as copy-on-write clones rather than in `zip`:
+    /// key -> (path of the stored clone, unix mode).
+    clone_sources: std::collections::HashMap<String, (PathBuf, Option<u32>)>,
+}
+
+/// Name of the zip entry listing objects stored as clones instead of in the zip.
+const CLONE_REFS: &str = "sccache-clone-refs";
+
+/// An object a storage holds as a copy-on-write clone, keyed by content hash.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloneRef {
+    pub key: String,
+    pub hash: String,
+    pub mode: Option<u32>,
+}
+
+/// A compiler output cloned into a storage's staging directory, waiting to be
+/// filed under its content hash. Deleted on drop unless the storage keeps it.
+pub struct StagedClone {
+    pub hash: String,
+    pub path: tempfile::TempPath,
 }
 
 /// Represents a failure to decompress stored object data.
@@ -95,7 +116,25 @@ impl CacheRead {
     {
         let z = ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
             .context("Failed to parse cache entry")?;
-        Ok(CacheRead { zip: z })
+        Ok(CacheRead {
+            zip: z,
+            clone_sources: Default::default(),
+        })
+    }
+
+    /// The objects this entry expects its storage to hold as clones.
+    pub fn clone_refs(&mut self) -> Result<Vec<CloneRef>> {
+        if self.zip.by_name(CLONE_REFS).is_err() {
+            return Ok(vec![]);
+        }
+        let mut json = Vec::new();
+        self.get_object(CLONE_REFS, &mut json)?;
+        serde_json::from_slice(&json).or(Err(anyhow!(DecompressionFailure)))
+    }
+
+    /// Restore object `key` by cloning the stored file at `path`.
+    pub fn set_clone_source(&mut self, key: String, path: PathBuf, mode: Option<u32>) {
+        self.clone_sources.insert(key, (path, mode));
     }
 
     /// Get an object from this cache entry at `name` and write it to `to`.
@@ -160,6 +199,19 @@ impl CacheRead {
                     Some(d) => d,
                     None => bail!("Output file without a parent directory!"),
                 };
+                if let Some((source, mode)) = self.clone_sources.remove(&key) {
+                    // A failed clone (the stored copy was just evicted, or the
+                    // output dir is on another volume) reads as a cache miss.
+                    restore_clone(&source, dir, &path, mode).map_err(|e| {
+                        debug!(
+                            "Couldn't clone {} to {}: {e:#}",
+                            source.display(),
+                            path.display()
+                        );
+                        anyhow!(DecompressionFailure)
+                    })?;
+                    continue;
+                }
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
                 // happening in parallel don't see a partially-written file.
@@ -202,6 +254,22 @@ impl CacheRead {
     }
 }
 
+/// Clone `source` into place at `path` (atomically, via a temporary file in
+/// `dir`), with `mode` and a fresh mtime, as if it had just been written:
+/// build tools compare output mtimes against their inputs.
+fn restore_clone(source: &Path, dir: &Path, path: &Path, mode: Option<u32>) -> Result<()> {
+    let tmp = tempfile::Builder::new()
+        .prefix(".sccache-clone")
+        .make_in(dir, |tmp| crate::util::clone_file(source, tmp))?;
+    if let Some(mode) = mode {
+        set_file_mode(tmp.path(), mode)?;
+    }
+    let now = filetime::FileTime::now();
+    filetime::set_file_times(tmp.path(), now, now)?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn is_path_null(path: &Path) -> bool {
     path == Path::new("/dev/null")
@@ -222,6 +290,9 @@ fn is_path_null(path: &Path) -> bool {
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
     zip: ZipWriter<Cursor<Vec<u8>>>,
+    /// Outputs staged as clones, for the storage to keep (see `take_clones`).
+    clones: Vec<StagedClone>,
+    clone_refs: Vec<CloneRef>,
 }
 
 impl CacheWrite {
@@ -229,7 +300,73 @@ impl CacheWrite {
     pub fn new() -> CacheWrite {
         CacheWrite {
             zip: ZipWriter::new(Cursor::new(vec![])),
+            clones: vec![],
+            clone_refs: vec![],
         }
+    }
+
+    /// Create a new cache entry for `objects`, cloning each into `staging_dir`
+    /// (copy-on-write: no file data is written) instead of compressing it into
+    /// the entry. The clones are snapshots, so the outputs changing afterwards
+    /// can't corrupt the cache. An object that can't be cloned is compressed
+    /// into the entry as usual.
+    pub async fn from_objects_cloned<T>(
+        objects: T,
+        staging_dir: PathBuf,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<CacheWrite>
+    where
+        T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
+    {
+        pool.spawn_blocking(move || {
+            let mut entry = CacheWrite::new();
+            for FileObjectSource {
+                key,
+                path,
+                optional,
+            } in objects
+            {
+                let f = fs::File::open(&path)
+                    .with_context(|| format!("failed to open file `{:?}`", path));
+                let mut f = match (f, optional) {
+                    (Ok(f), _) => f,
+                    (Err(e), false) => return Err(e),
+                    (Err(_), true) => continue,
+                };
+                let mode = get_file_mode(&f)?;
+                let staged = tempfile::Builder::new()
+                    .prefix("stage-")
+                    .make_in(&staging_dir, |tmp| crate::util::clone_file(&path, tmp));
+                match staged {
+                    Ok(staged) => {
+                        let staged = staged.into_temp_path();
+                        let hash = crate::util::Digest::reader_sync(fs::File::open(&*staged)?)?;
+                        entry.clone_refs.push(CloneRef {
+                            key,
+                            hash: hash.clone(),
+                            mode,
+                        });
+                        entry.clones.push(StagedClone { hash, path: staged });
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Couldn't clone {} into the cache, storing a compressed copy: {e}",
+                            path.display()
+                        );
+                        entry.put_object(&key, &mut f, mode).with_context(|| {
+                            format!("failed to put object `{:?}` in cache entry", path)
+                        })?;
+                    }
+                }
+            }
+            Ok(entry)
+        })
+        .await?
+    }
+
+    /// Take the staged clones, for a storage to file under their hashes.
+    pub fn take_clones(&mut self) -> Vec<StagedClone> {
+        std::mem::take(&mut self.clones)
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
@@ -306,8 +443,12 @@ impl CacheWrite {
     }
 
     /// Finish writing data to the cache entry writer, and return the data.
-    pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { mut zip } = self;
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if !self.clone_refs.is_empty() {
+            let refs = serde_json::to_vec(&self.clone_refs)?;
+            self.put_object(CLONE_REFS, &mut Cursor::new(refs), None)?;
+        }
+        let CacheWrite { mut zip, .. } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }

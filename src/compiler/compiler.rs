@@ -800,9 +800,13 @@ where
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
-                let mut entry = CacheWrite::from_objects(outputs, &pool)
-                    .await
-                    .context("failed to zip up compiler outputs")?;
+                let mut entry = match storage.clone_staging_dir() {
+                    Some(staging_dir) => {
+                        CacheWrite::from_objects_cloned(outputs, staging_dir, &pool).await
+                    }
+                    None => CacheWrite::from_objects(outputs, &pool).await,
+                }
+                .context("failed to zip up compiler outputs")?;
 
                 entry.put_stdout(&compiler_result.stdout)?;
                 entry.put_stderr(&compiler_result.stderr)?;

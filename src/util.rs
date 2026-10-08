@@ -455,6 +455,72 @@ fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Create `dst` (which must not exist) as a copy-on-write clone of `src`: a new
+/// file sharing `src`'s blocks, so no file data is written. APFS (macOS) and
+/// reflink-capable Linux filesystems (btrfs, XFS) support this; elsewhere it
+/// fails with `Unsupported`.
+#[cfg(target_os = "macos")]
+pub fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // <sys/clonefile.h>; not in the libc crate.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let c_src = std::ffi::CString::new(src.as_os_str().as_bytes())?;
+    let c_dst = std::ffi::CString::new(dst.as_os_str().as_bytes())?;
+    // SAFETY: both arguments are valid NUL-terminated paths.
+    if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), CLONE_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // <linux/fs.h>: _IOW(0x94, 9, int)
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let source = std::fs::File::open(src)?;
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    // SAFETY: both fds are open; FICLONE makes `target` share `source`'s extents.
+    if unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        drop(target);
+        let _ = std::fs::remove_file(dst);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn clone_file(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// Whether files in `dir` can be cloned with [`clone_file`], found by trying it.
+pub fn clones_supported(dir: &Path) -> bool {
+    let probe = || -> std::io::Result<()> {
+        let src = tempfile::NamedTempFile::new_in(dir)?;
+        std::fs::write(src.path(), b"sccache clone probe")?;
+        let dst = src.path().with_extension("clone-probe");
+        let result = clone_file(src.path(), &dst);
+        let _ = std::fs::remove_file(&dst);
+        result
+    };
+    match probe() {
+        Ok(()) => true,
+        Err(e) => {
+            debug!(
+                "Copy-on-write clones unavailable in {}: {}",
+                dir.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Format `duration` as seconds with a fractional component.
 pub fn fmt_duration_as_secs(duration: &Duration) -> String {
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
