@@ -422,6 +422,38 @@ fn replace_paths(line: &str, from: &str, to: &str, separator: u8) -> String {
     out
 }
 
+/// The contents of the crate's Rust source files, or `None` if any can't be
+/// read as UTF-8 (in which case nothing is proven about them).
+fn read_rust_sources(cwd: &Path, source_files: &[PathBuf]) -> Option<Vec<String>> {
+    source_files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| std::fs::read_to_string(cwd.join(path)).ok())
+        .collect()
+}
+
+/// Whether every use of the environment variable `var` in `sources` is the
+/// first argument of `concat!` inside `include!`, `include_str!` or
+/// `include_bytes!` -- i.e. the value only locates files read at compile time,
+/// and never ends up in the compiled output. At least one such use is
+/// required: a value used only through some other crate's macro proves
+/// nothing.
+fn env_dep_only_included(var: &str, sources: &[String]) -> bool {
+    let var = regex::escape(var);
+    let any_use = regex::Regex::new(&format!(r#"\b(?:option_)?env!\s*\(\s*"{var}"\s*\)"#))
+        .expect("valid regex");
+    let included = regex::Regex::new(&format!(
+        r#"\binclude(?:_str|_bytes)?!\s*\(\s*concat!\s*\(\s*env!\s*\(\s*"{var}"\s*\)"#
+    ))
+    .expect("valid regex");
+    let (mut uses, mut includes) = (0, 0);
+    for source in sources {
+        uses += any_use.find_iter(source).count();
+        includes += included.find_iter(source).count();
+    }
+    uses > 0 && uses == includes
+}
+
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
@@ -1640,15 +1672,30 @@ where
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
-        // Build-script env deps (OUT_DIR) are absolute paths under the cargo
-        // profile dir (the parent of --out-dir), which differs per checkout.
-        // Hash them relative to it so identical crates hit across worktrees.
+        // Build-script env deps (OUT_DIR, or a path a build script passes via
+        // cargo:rustc-env) are absolute paths under the cargo profile dir (the
+        // parent of --out-dir), which differs per checkout. Hash them relative
+        // to it so identical crates hit across worktrees -- but only when the
+        // crate's sources prove the path is used solely to include files at
+        // compile time (whose contents are hashed). If the crate could embed
+        // the path itself, a hit would hand it another checkout's path.
         let abs_out_dir = cwd.join(&self.parsed_args.output_dir);
         let profile_dir = abs_out_dir.parent();
+        let mut rust_sources: Option<Option<Vec<String>>> = None;
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            match profile_dir.and_then(|d| Path::new(val).strip_prefix(d).ok()) {
+            let relative = profile_dir
+                .and_then(|d| Path::new(val).strip_prefix(d).ok())
+                .filter(|_| {
+                    let sources =
+                        rust_sources.get_or_insert_with(|| read_rust_sources(&cwd, &source_files));
+                    sources.as_ref().is_some_and(|sources| {
+                        var.to_str()
+                            .is_some_and(|var| env_dep_only_included(var, sources))
+                    })
+                });
+            match relative {
                 Some(rel) => {
                     m.update(b"<cargo-profile-dir>/");
                     rel.as_os_str().hash(&mut HashToDigest { digest: &mut m });
@@ -3779,7 +3826,15 @@ proc_macro false
     where
         F: Fn(&Path) -> Result<()>,
     {
-        hash_key_with_env_deps(f, args, env_vars, &[], pre_func, preprocessor_cache_mode)
+        hash_key_with_env_deps(
+            f,
+            args,
+            env_vars,
+            &[],
+            "",
+            pre_func,
+            preprocessor_cache_mode,
+        )
     }
 
     fn hash_key_with_env_deps<F>(
@@ -3787,6 +3842,7 @@ proc_macro false
         args: &[&str],
         env_vars: &[(OsString, OsString)],
         env_deps: &[(&str, &str)],
+        source: &str,
         pre_func: F,
         preprocessor_cache_mode: bool,
     ) -> String
@@ -3798,11 +3854,14 @@ proc_macro false
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
-        // Just use empty files for sources.
+        // Just use empty files for sources, unless the test gives contents.
         {
             let src = &"foo.rs";
             let s = format!("Failed to create {}", src);
-            f.touch(src).expect(&s);
+            create_file(f.tempdir.path(), src, |mut file| {
+                file.write_all(source.as_bytes())
+            })
+            .expect(&s);
         }
         // as well as externs
         for e in parsed_args.externs.iter() {
@@ -3905,7 +3964,12 @@ proc_macro false
         );
     }
 
-    fn out_dir_hash_key(f: &TestFixture, checkout: &str, out_dir_rel: &str) -> String {
+    fn out_dir_hash_key(
+        f: &TestFixture,
+        checkout: &str,
+        out_dir_rel: &str,
+        source: &str,
+    ) -> String {
         let out_dir = format!("{checkout}/target/debug/deps");
         let env_out_dir = f
             .tempdir
@@ -3929,6 +3993,7 @@ proc_macro false
             &args,
             &[],
             &[("OUT_DIR", env_out_dir.to_str().unwrap())],
+            source,
             nothing,
             false,
         )
@@ -3938,8 +4003,18 @@ proc_macro false
     fn test_equal_hashes_out_dir_across_checkouts() {
         let f = TestFixture::new();
         assert_eq!(
-            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out"),
-            out_dir_hash_key(&f, "checkout-b", "build/foo-0123/out"),
+            out_dir_hash_key(
+                &f,
+                "checkout-a",
+                "build/foo-0123/out",
+                r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));"#
+            ),
+            out_dir_hash_key(
+                &f,
+                "checkout-b",
+                "build/foo-0123/out",
+                r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));"#
+            ),
         );
     }
 
@@ -3947,8 +4022,85 @@ proc_macro false
     fn test_different_hashes_out_dir_within_profile_dir() {
         let f = TestFixture::new();
         assert_ne!(
-            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out"),
-            out_dir_hash_key(&f, "checkout-a", "build/foo-4567/out"),
+            out_dir_hash_key(
+                &f,
+                "checkout-a",
+                "build/foo-0123/out",
+                r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));"#
+            ),
+            out_dir_hash_key(
+                &f,
+                "checkout-a",
+                "build/foo-4567/out",
+                r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));"#
+            ),
+        );
+    }
+
+    #[test]
+    fn test_env_dep_only_included_table() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "include of generated code",
+                &[r#"include!(concat!(env!("OUT_DIR"), "/bindings.rs"));"#],
+                true,
+            ),
+            (
+                "include_str and include_bytes, multi-line",
+                &[
+                    "const A: &str = include_str!(\n    concat!(env!(\"OUT_DIR\"), \"/a.txt\"));",
+                    r#"const B: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", "b.bin"));"#,
+                ],
+                true,
+            ),
+            (
+                "embedded as a runtime path",
+                &[
+                    r#"include!(concat!(env!("OUT_DIR"), "/x.rs"));"#,
+                    r#"pub const ASSETS: &str = concat!(env!("OUT_DIR"), "/assets");"#,
+                ],
+                false,
+            ),
+            (
+                "option_env",
+                &[r#"const D: Option<&str> = option_env!("OUT_DIR");"#],
+                false,
+            ),
+            (
+                "only via another crate's macro",
+                &["tonic::include_proto!(\"x\");"],
+                false,
+            ),
+            (
+                "a different variable",
+                &[
+                    r#"include!(concat!(env!("OUT_DIR_2"), "/x.rs")); const P: &str = env!("OUT_DIR_2");"#,
+                ],
+                false,
+            ),
+        ];
+        for (label, sources, expected) in cases {
+            let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                env_dep_only_included("OUT_DIR", &sources),
+                *expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_out_dir_hashed_absolutely_when_embedded() {
+        let f = TestFixture::new();
+        let embeds = r#"include!(concat!(env!("OUT_DIR"), "/gen.rs")); pub const P: &str = env!("OUT_DIR");"#;
+        assert_ne!(
+            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out", embeds),
+            out_dir_hash_key(&f, "checkout-b", "build/foo-0123/out", embeds),
+        );
+        assert_ne!(
+            out_dir_hash_key(&f, "checkout-a", "build/foo-0123/out", ""),
+            out_dir_hash_key(&f, "checkout-b", "build/foo-0123/out", ""),
+            "no visible use proves nothing"
         );
     }
 
